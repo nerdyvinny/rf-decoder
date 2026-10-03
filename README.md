@@ -90,3 +90,5 @@ pilot, and RDS groups with a station name, text, and clock), run it through the
 same code, and check that exactly that data comes back. They also cover the
 signal arriving upside down, damaged bits, a mono station with no pilot, and a
 song change.
+
+(READ ME GENERATED WITH AI)
