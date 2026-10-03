@@ -1,4 +1,4 @@
-# FM Radio Data Decoder
+# FM Radio RF Decoder
 
 Decodes RDS, the hidden data that FM radio stations send along with the music:
 the station's call letters, its name, the song that's playing, and the time.
