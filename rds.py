@@ -1,19 +1,4 @@
-# rds.py
-# Decodes RDS, the digital data FM stations send along with the audio
-# (call letters, station name, the song that's playing, the time).
-#
-# How RDS works, the short version:
-#  - It sits at 57 kHz in the FM baseband, exactly 3 times the 19 kHz stereo pilot tone.
-#  - It sends 1187.5 bits per second, exactly the pilot / 16.
-#  - Each bit is sent as a pulse and then the same pulse flipped ("biphase").
-#  - The bits are differentially coded: a 1 means "different from the last bit".
-#  - Bits come in 26 bit blocks: 16 bits of data and a 10 bit check.
-#  - 4 blocks (A, B, C, D) make a group. A is the station code, B says what
-#    kind of group it is, C and D carry the actual data.
-#
-# The pilot is loud and the RDS signal is quiet, so the pilot is used as the
-# clock for everything: the RDS carrier is the pilot x3 and the bit clock is
-# the pilot / 16. That also cancels out any error in the dongle's own clock.
+# decodes rds data from an fm station
 
 from datetime import datetime, timedelta
 
@@ -21,17 +6,10 @@ import numpy as np
 
 PILOT = 19000
 RDS_CARRIER = 57000
-RDS_WIDTH = 2400  # the RDS signal takes up 57 kHz +- 2.4 kHz
-
-# The 10 bit check is the remainder after dividing by this polynomial
-# (x^10 + x^8 + x^7 + x^5 + x^4 + x^3 + 1), same idea as a CRC.
+RDS_WIDTH = 2400
 CHECK_POLY = 0b10110111001
-
-# Each block position adds its own "offset" to the check, so a good block also
-# tells you which block it is. C' is used instead of C in some groups.
 OFFSETS = {"A": 0x0FC, "B": 0x198, "C": 0x168, "C'": 0x350, "D": 0x1B4}
 
-# program types for North America (RBDS). Europe uses a different list.
 PROGRAM_TYPES = [
     "None", "News", "Information", "Sports", "Talk", "Rock", "Classic Rock", "Adult Hits",
     "Soft Rock", "Top 40", "Country", "Oldies", "Soft", "Nostalgia", "Jazz", "Classical",
@@ -41,16 +19,9 @@ PROGRAM_TYPES = [
 ]
 
 
-# ---------- step 1: FM baseband -> bits ----------
-
 def bandpass(signal, sample_rate, low_hz, high_hz):
-    # Keeps only the frequencies between low_hz and high_hz using an FFT.
-    # Returns a complex signal (only the positive frequencies are kept).
-    # Has to be float64: with float32 the pilot's phase drifted (a 3 second
-    # test signal read 6 Hz off), which slowly messes up the bit timing.
-    #
-    # The FFT is padded with zeros up to a power of 2. A 30 second recording is
-    # 7,499,999 samples, and an FFT that length took 3.8 s instead of 0.2 s.
+    # float64 or the pilot drifts
+    # pad to a power of 2 so the fft is fast
     size = 1
     while size < len(signal):
         size = size * 2
@@ -61,35 +32,26 @@ def bandpass(signal, sample_rate, low_hz, high_hz):
 
 
 def get_bits(baseband, sample_rate):
-    # find the pilot tone
     pilot = bandpass(baseband, sample_rate, PILOT - 15, PILOT + 15)
     nearby = bandpass(baseband, sample_rate, PILOT + 200, PILOT + 230)
     if np.median(np.abs(pilot)) < 4 * np.median(np.abs(nearby)):
         raise ValueError("no 19 kHz pilot tone, this only works on stereo stations")
-    pilot = pilot / np.abs(pilot)  # only the phase matters
+    pilot = pilot / np.abs(pilot)
 
-    # Move the RDS signal down to 0 Hz using the pilot x3.
-    # (Cubing the pilot triples its phase, so it turns into a 57 kHz tone locked to the pilot.)
+    # the rds carrier is the pilot times 3
     rds = bandpass(baseband, sample_rate, RDS_CARRIER - RDS_WIDTH, RDS_CARRIER + RDS_WIDTH)
     rds = rds * np.conj(pilot ** 3)
-
-    # The RDS signal sits at some fixed angle compared to the pilot. Squaring it
-    # gets rid of the +1/-1 data and leaves 2x that angle, so measure it and
-    # rotate it out. Then the data is just the real part.
     angle = np.angle(np.sum(rds ** 2)) / 2
     rds = np.real(rds * np.exp(-1j * angle))
 
-    # Bit timing: the bit clock is the pilot / 16, so count pilot cycles.
-    # (Measured over the middle 80% since the FFT filter is messy at the very start and end.)
+    # the bit clock is the pilot divided by 16
     cycles = np.unwrap(np.angle(pilot)) / (2 * np.pi)
     a = len(cycles) // 10
     b = len(cycles) * 9 // 10
     cycles_per_sample = (cycles[b] - cycles[a]) / (b - a)
-    samples_per_bit = 16 / cycles_per_sample  # about 210.5 at 250k samples per second
+    samples_per_bit = 16 / cycles_per_sample
 
-    # Each bit is a pulse then its mirror image, so take first half minus second half.
-    # We don't know where the first bit starts, so try 32 starting points and keep
-    # the one where the bits come out strongest. (running_sum makes the half sums fast)
+    # try 32 starting points and keep the strongest
     running_sum = np.concatenate(([0.0], np.cumsum(rds)))
     best_score = -1
     best_values = None
@@ -106,7 +68,7 @@ def get_bits(baseband, sample_rate):
             best_score = score
             best_values = values
 
-    # undo the differential coding: a 1 means the sign changed from the last bit
+    # a 1 means the sign changed
     sent = best_values > 0
     bits = []
     for i in range(1, len(sent)):
@@ -117,10 +79,7 @@ def get_bits(baseband, sample_rate):
     return bits
 
 
-# ---------- step 2: bits -> blocks and groups ----------
-
 def calc_check(data):
-    # the 10 bit check for 16 bits of data
     reg = data << 10
     for i in range(25, 9, -1):
         if (reg >> i) & 1:
@@ -135,19 +94,11 @@ def block_ok(word, offset):
 
 
 def read_block(word, names):
-    # Returns the 16 data bits of a block, or None if it's broken.
-    # names = which blocks are allowed in this spot, like ["C", "C'"]
     for name in names:
         if block_ok(word, OFFSETS[name]):
             return word >> 10
 
-    # Not good as is, so try to fix it: flip 1 bit, or 2 bits next to each other.
-    # 2 next to each other is the most common error: because of the differential
-    # coding, one wrong decision on the air flips 2 neighbouring data bits.
-    # (Longer bursts could be fixed too, but the more you allow, the more likely
-    # a badly broken block gets "fixed" into the wrong data.)
-    # Note: this only works because blocks are read at the spot where they belong.
-    # A good A block read as a B block can look like a B block with 2 bad bits.
+    # try fixing 1 bad bit or 2 next to each other
     for name in names:
         for i in range(26):
             if block_ok(word ^ (1 << i), OFFSETS[name]):
@@ -159,7 +110,6 @@ def read_block(word, names):
 
 
 def get_word(bits, i):
-    # the 26 bits starting at position i, as one number
     word = 0
     for bit in bits[i:i + 26]:
         word = (word << 1) | bit
@@ -167,12 +117,7 @@ def get_word(bits, i):
 
 
 def get_groups(bits):
-    # Lines the bits up into groups of 4 blocks.
-    # Returns (groups, good_blocks, total_blocks). Each group is [a, b, c, d],
-    # each one 16 bits of data, or None if that block was broken.
-
-    # Find where the groups start: move along one bit at a time until there's
-    # a good A block with a good B block right after it.
+    # find a good A block followed by a good B block
     start = None
     for i in range(len(bits) - 52):
         if block_ok(get_word(bits, i), OFFSETS["A"]) and block_ok(get_word(bits, i + 26), OFFSETS["B"]):
@@ -198,8 +143,6 @@ def get_groups(bits):
     return groups, good, total
 
 
-# ---------- step 3: groups -> station info ----------
-
 def to_char(code):
     if 32 <= code < 127:
         return chr(code)
@@ -207,14 +150,12 @@ def to_char(code):
 
 
 def call_letters(pi):
-    # US stations: the station code is the call letters counted in base 26.
-    # K stations start at 0x1000 (KAAA), W stations start at 0x54A8 (WAAA).
-    # Codes starting with A are a short form that gets expanded first.
+    # us call letters counted in base 26
     if pi >> 12 == 0xA:
         if (pi >> 8) & 0xF == 0xF:
-            pi = (pi & 0xFF) << 8  # AFxy -> xy00
+            pi = (pi & 0xFF) << 8
         else:
-            pi = (((pi >> 8) & 0xF) << 12) | (pi & 0xFF)  # Axyz -> x0yz
+            pi = (((pi >> 8) & 0xF) << 12) | (pi & 0xFF)
     if 0x1000 <= pi <= 0x54A7:
         first = "K"
         n = pi - 0x1000
@@ -222,7 +163,7 @@ def call_letters(pi):
         first = "W"
         n = pi - 0x54A8
     else:
-        return None  # 3 letter call signs, Canada and Mexico work differently
+        return None
     return first + chr(65 + n // 676) + chr(65 + (n // 26) % 26) + chr(65 + n % 26)
 
 
@@ -233,14 +174,13 @@ def program_type(pty):
 
 
 def decode_clock(b, c, d):
-    # The date is sent as days since Nov 17 1858 (the "modified julian day").
-    # Returns (local time, hours from UTC), or None if it doesn't make sense.
+    # date is days since nov 17 1858
     mjd = ((b & 3) << 15) | (c >> 1)
     hour = ((c & 1) << 4) | (d >> 12)
     minute = (d >> 6) & 63
     if hour > 23 or minute > 59 or mjd < 50000:
         return None
-    offset = (d & 31) / 2  # local time offset, sent in half hours
+    offset = (d & 31) / 2
     if (d >> 5) & 1:
         offset = -offset
     utc = datetime(1858, 11, 17) + timedelta(days=mjd, hours=hour, minutes=minute)
@@ -266,28 +206,26 @@ def decode_groups(groups):
         if a is not None:
             pi_counts[a] = pi_counts.get(a, 0) + 1
         if b is None:
-            continue  # without block B we don't know what kind of group this is
+            continue
         group_type = b >> 12
         version_b = (b >> 11) & 1
         pty = (b >> 5) & 31
         pty_counts[pty] = pty_counts.get(pty, 0) + 1
 
         if group_type == 0 and d is not None:
-            # station name, 8 letters, 2 per group
+            # station name
             part = b & 3
             name[part * 2] = to_char(d >> 8)
             name[part * 2 + 1] = to_char(d & 255)
             name_parts.add(part)
             if len(name_parts) == 4:
-                # all 4 parts are fresh, so this is one whole name
                 station["names"].append("".join(name))
                 name_parts = set()
 
         elif group_type == 2:
-            # radio text, up to 64 letters, 4 per group (2 per group in version B)
+            # radio text
             flag = (b >> 4) & 1
             if flag != text_flag:
-                # the station flips this flag when the text changes, so start over
                 text = [None] * 64
                 text_flag = flag
             part = b & 15
@@ -295,7 +233,6 @@ def decode_groups(groups):
                 text[part * 4:part * 4 + 4] = [c >> 8, c & 255, d >> 8, d & 255]
             elif version_b == 1 and d is not None:
                 text[part * 2:part * 2 + 2] = [d >> 8, d & 255]
-            # the text ends at a carriage return (13), or at the max length
             end = 64 if version_b == 0 else 32
             if 13 in text:
                 end = text.index(13)
@@ -306,6 +243,7 @@ def decode_groups(groups):
                 text = [None] * 64
 
         elif group_type == 4 and version_b == 0 and c is not None and d is not None:
+            # clock
             clock = decode_clock(b, c, d)
             if clock is not None:
                 station["clock"] = clock
@@ -316,7 +254,6 @@ def decode_groups(groups):
 
 
 def decode_station(baseband, sample_rate):
-    # everything in one go: FM baseband -> station info
     bits = get_bits(baseband, sample_rate)
     groups, good, total = get_groups(bits)
     station = decode_groups(groups)
@@ -326,9 +263,7 @@ def decode_station(baseband, sample_rate):
 
 
 def newest_song(texts):
-    # The newest radio text that came through at least twice. A text that only
-    # shows up once can be half the old text and half the new one (when the
-    # station changes it in the middle), so those are skipped.
+    # only count a text if it showed up twice
     for text in reversed(texts):
         if texts.count(text) >= 2:
             return text

@@ -1,13 +1,4 @@
-# main.py
-# FM radio decoder. Reads the hidden RDS data that FM stations send (call letters,
-# station name, the song that's playing) using an RTL-SDR dongle.
-#
-#   python main.py 92.3            listen for 30 seconds and show what the station is sending
-#   python main.py 92.3 --live     keep listening and print each new song (Ctrl+C to stop)
-#   python main.py 92.3 --wav      save 30 seconds of the station's audio to a wav file
-#   python main.py --file recordings/fm-92.3.cu8     decode a saved recording instead
-#
-# Close SDR# first, only one program can use the dongle at a time.
+# fm radio decoder
 
 import argparse
 import os
@@ -33,8 +24,7 @@ def show_station(station):
     print(f"call letters:  {letters}  (station code 0x{station['pi']:04X})")
     print(f"program type:  {rds.program_type(station['pty'])}")
 
-    # A lot of stations scroll their 8 letter name like a banner, so show every
-    # piece that came through at least twice (once only = half old, half new).
+    # names that showed up at least twice
     counts = Counter(station["names"])
     names = []
     for name in station["names"]:
@@ -105,9 +95,7 @@ def save_audio(freq_mhz, seconds, gain):
 
 
 def listen_live(freq_mhz, gain):
-    # Listens 10 seconds at a time, decodes it, and prints anything new.
-    # While it decodes, a few seconds of signal get skipped, which doesn't matter
-    # because stations repeat their text over and over.
+    # listen 10 seconds at a time and print anything new
     lib, dev = radio.open_radio(round(freq_mhz * 1e6), SAMPLE_RATE, gain)
     print(f"listening to {freq_mhz} MHz, press Ctrl+C to stop")
     print("(new songs show up within about 15 seconds)")
